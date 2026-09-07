@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "anders81fin.omfasty",
+  "name": "omfasty",
+  "version": "1.0.0",
+  "author": "anders81fin",
+  "description": "Intermittent fasting timer with target hours, progress and streak, in the bar",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "omfasty",
+    "description": "Intermittent fasting timer with target hours, progress and streak",
+    "category": "Health",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
