@@ -15,7 +15,9 @@ import time
 STATE_DIR = os.path.expanduser("~/.local/state/omarchy-fasting")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 HISTORY_FILE = os.path.join(STATE_DIR, "history.jsonl")
-HISTORY_KEEP = 5
+RECENT_COUNT = 3
+RECENT_MIN_HOURS = 12.0
+LONGEST_COUNT = 3
 DEFAULT_TARGET_HOURS = 16.0
 
 
@@ -72,6 +74,16 @@ def compute_streak(entries):
     return streak
 
 
+def recent_long_fasts(entries):
+    long_enough = [e for e in entries if e.get("actualHours", 0) >= RECENT_MIN_HOURS]
+    long_enough.sort(key=lambda e: e.get("end", 0), reverse=True)
+    return long_enough[:RECENT_COUNT]
+
+
+def longest_fasts(entries):
+    return sorted(entries, key=lambda e: e.get("actualHours", 0), reverse=True)[:LONGEST_COUNT]
+
+
 def cmd_start(hours):
     state = load_state()
     if not state["fasting"]:
@@ -115,7 +127,8 @@ def cmd_status():
         "targetHours": state["targetHours"],
         "streak": compute_streak(entries),
         "lastEnd": entries[-1]["end"] if entries else 0,
-        "history": list(reversed(entries[-HISTORY_KEEP:])),
+        "history": recent_long_fasts(entries),
+        "longestHistory": longest_fasts(entries),
     }))
 
 

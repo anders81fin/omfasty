@@ -42,8 +42,17 @@ Panel {
   property real targetHours: 16
   property int streak: 0
   property var history: []
+  property var longestHistory: []
   property int lastEnd: 0
   property int nowEpoch: Math.floor(Date.now() / 1000)
+
+  // Highest whole-hour mark already notified for, so the hourly nudge
+  // fires once per boundary instead of once per second. Reset whenever a
+  // new fast or eating window starts, seeded to the current progress (not
+  // 0) so resuming after a shell restart doesn't replay every hour missed
+  // while nothing was watching.
+  property int lastNotifiedFastHour: 0
+  property int lastNotifiedEatingHour: 0
 
   readonly property real elapsedHours: fasting ? Math.max(0, (nowEpoch - startedAt) / 3600) : 0
   readonly property real progressFraction: targetHours > 0 ? Math.min(1, elapsedHours / targetHours) : 0
@@ -79,6 +88,38 @@ Panel {
     if (remaining > targetHrs * 0.5) return { title: "Fueling up", blurb: "eat well, the fast comes back around" }
     if (remaining > 0) return { title: "Window closing soon", blurb: "last orders, plan that final bite" }
     return { title: "Into overtime", blurb: "window's technically closed, no judgment" }
+  }
+
+  // Hourly desktop-notification flavor text — same tongue-in-cheek tone as
+  // the stage commentary above, just short enough for a notification body.
+  function fastHourMessages(hours) {
+    return [
+      "Hour " + hours + " down. Willpower: still fully charged.",
+      hours + "h fasted — glycogen's quietly packing its bags.",
+      "Still going at " + hours + "h. Future you says thanks.",
+      hours + " hours in. Hunger's just a suggestion at this point.",
+      "Clocked " + hours + "h fasting. Cells are taking notes for the cleanup crew.",
+      hours + "h down, " + targetHours + "h to go. Onward."
+    ]
+  }
+
+  function eatingHourMessages(hours) {
+    return [
+      hours + "h into the eating window — get some food in before the fast's back on.",
+      "Eating window: " + hours + "h used. The clock's ticking toward the next fast.",
+      hours + "h in — refuel now, the fast doesn't wait around.",
+      "Still got food on the table? " + hours + "h into the window already.",
+      hours + "h eating so far. Don't let the window close on an empty plate."
+    ]
+  }
+
+  function randomOf(list) {
+    return list[Math.floor(Math.random() * list.length)]
+  }
+
+  function notify(title, body) {
+    notifyProc.command = ["notify-send", "-a", "omfasty", title, body]
+    notifyProc.running = true
   }
 
   readonly property string heroTitle: fasting ? "Fasting" : (hasEatingHistory ? "Eating window" : "Ready when you are")
@@ -117,6 +158,7 @@ Panel {
     root.streak = data.streak || 0
     root.lastEnd = data.lastEnd || 0
     root.history = data.history || []
+    root.longestHistory = data.longestHistory || []
     root.nowEpoch = Math.floor(Date.now() / 1000)
   }
 
@@ -139,15 +181,40 @@ Panel {
 
   onOpenedChanged: if (opened) refresh()
 
+  // Seed the "already notified up to here" marks to the current progress
+  // rather than 0 whenever a fresh fast/eating-window shows up in a status
+  // reply (fast just started, fast just ended, or the shell just restarted
+  // mid-fast) — otherwise the first tick after that would fire one nudge
+  // per hour already elapsed.
+  onStartedAtChanged: lastNotifiedFastHour = fasting ? Math.floor(elapsedHours) : 0
+  onLastEndChanged: lastNotifiedEatingHour = hasEatingHistory ? Math.floor(eatingElapsedHours) : 0
+
   // Live 1s tick drives both the fasting countup and the eating-window
   // countup; the CLI round-trip only happens on open, on actions, and every
   // 60s in case another surface (e.g. a terminal) changed the state file
-  // underneath the shell.
+  // underneath the shell. Piggybacks the hourly notification check since
+  // both need the same up-to-date clock.
   Timer {
     interval: 1000
     running: true
     repeat: true
-    onTriggered: root.nowEpoch = Math.floor(Date.now() / 1000)
+    onTriggered: {
+      root.nowEpoch = Math.floor(Date.now() / 1000)
+
+      if (root.fasting) {
+        var fh = Math.floor(root.elapsedHours)
+        if (fh > root.lastNotifiedFastHour) {
+          root.lastNotifiedFastHour = fh
+          root.notify("omfasty — " + fh + "h fasting", root.randomOf(root.fastHourMessages(fh)))
+        }
+      } else if (root.hasEatingHistory) {
+        var eh = Math.floor(root.eatingElapsedHours)
+        if (eh > root.lastNotifiedEatingHour) {
+          root.lastNotifiedEatingHour = eh
+          root.notify("omfasty — " + eh + "h eating", root.randomOf(root.eatingHourMessages(eh)))
+        }
+      }
+    }
   }
 
   Timer {
@@ -172,6 +239,13 @@ Panel {
       waitForEnd: true
       onStreamFinished: root.applyStatus(text)
     }
+  }
+
+  // Fire-and-forget hourly nudge. Silently a no-op if notify-send (or a
+  // notification daemon to receive it) isn't installed — never blocks the
+  // timer or the rest of the widget.
+  Process {
+    id: notifyProc
   }
 
   implicitWidth: button.implicitWidth
@@ -454,6 +528,8 @@ Panel {
                   verticalPadding: Style.spacing.controlPaddingY
                   bordered: true
                   active: root.targetHours === modelData.hours
+                  enabled: !root.fasting
+                  opacity: enabled ? 1.0 : 0.5
                   onClicked: root.setTarget(modelData.hours)
                 }
               }
@@ -479,7 +555,7 @@ Panel {
 
           // ---------- History ----------
           PanelSeparator {
-            visible: root.history.length > 0
+            visible: root.history.length > 0 || root.longestHistory.length > 0
             foreground: root.bar.foreground
           }
 
@@ -504,6 +580,52 @@ Panel {
 
                 Row {
                   id: historyRow
+                  width: parent.width
+                  spacing: Style.space(8)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: modelData.actualHours >= modelData.targetHours ? root.iconDone : root.iconHistoryPartial
+                    color: root.bar.foreground
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: Qt.formatDate(new Date(modelData.end * 1000), "d.M.")
+                      + "  " + modelData.actualHours.toFixed(1) + "h / " + modelData.targetHours + "h"
+                    color: Qt.darker(root.bar.foreground, 1.2)
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+            }
+          }
+
+          // ---------- Longest fasts ----------
+          Column {
+            visible: root.longestHistory.length > 0
+            width: parent.width
+            spacing: Style.space(6)
+
+            PanelSectionHeader {
+              text: "LONGEST"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+            }
+
+            Repeater {
+              model: root.longestHistory
+
+              Item {
+                required property var modelData
+                width: column.width
+                implicitHeight: longestRow.implicitHeight
+
+                Row {
+                  id: longestRow
                   width: parent.width
                   spacing: Style.space(8)
 

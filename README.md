@@ -11,9 +11,11 @@ An intermittent-fasting timer for the [Omarchy](https://omarchy.org) shell bar. 
 - **Eating-window tracking** — once a fast ends, the same pill counts up the time since, against the eating-window target implied by the ratio you picked (`24 - fasting hours`).
 - **Progress bar** and a **streak counter** for fasts that hit their target.
 - **Physiology-stage commentary** — a tongue-in-cheek line that updates through the fast (blood sugar, glycogen, the metabolic switch, ketosis, autophagy) and through the eating window (fueling up, window closing, into overtime). Not medical advice — it's a bar widget, not a lab.
-- **Recent history** — the last five completed fasts with actual vs. target hours.
+- **Recent history** — the last three completed fasts of at least 12h, with actual vs. target hours.
+- **Longest fasts** — the three longest fasts ever measured, regardless of when they happened.
+- **Hourly nudges** — a desktop notification every hour on the clock, both while fasting (a short encouragement) and during the eating window (a reminder to eat before the next fast starts). Requires `notify-send` and a running notification daemon; silently skipped if neither is available.
 
-Click the bar pill to open the popup; pick a ratio to start a fast (or change the target of one already running), and use "End fast" to stop it.
+Click the bar pill to open the popup; pick a ratio, then "Start fast" to begin. The ratio presets lock once a fast is running — end the fast to pick a different target.
 
 ## Installing
 
@@ -25,7 +27,7 @@ Or by hand: drop this folder into `~/.config/omarchy/plugins/anders81fin.omfasty
 
 ## How it works
 
-State lives outside the shell, in `fasting-cli.py` (a small Python script writing to `~/.local/state/omarchy-fasting/`), so it survives shell restarts and stays simple to inspect or edit by hand. The QML side (`Panel.qml`) just shells out to it and renders the result.
+State lives outside the shell, in `fasting-cli.py` (a small Python script writing to `~/.local/state/omarchy-fasting/`), so it survives shell restarts and stays simple to inspect or edit by hand. The QML side (`Panel.qml`) just shells out to it and renders the result, and calls `notify-send` directly for the hourly nudges.
 
 ## License
 
