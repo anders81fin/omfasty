@@ -454,7 +454,7 @@ Panel {
                   verticalPadding: Style.spacing.controlPaddingY
                   bordered: true
                   active: root.targetHours === modelData.hours
-                  onClicked: root.fasting ? root.setTarget(modelData.hours) : root.start(modelData.hours)
+                  onClicked: root.setTarget(modelData.hours)
                 }
               }
             }
