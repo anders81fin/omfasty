@@ -93,13 +93,16 @@ Panel {
   // Hourly desktop-notification flavor text — same tongue-in-cheek tone as
   // the stage commentary above, just short enough for a notification body.
   function fastHourMessages(hours) {
+    var remaining = targetHours - hours
     return [
       "Hour " + hours + " down. Willpower: still fully charged.",
       hours + "h fasted — glycogen's quietly packing its bags.",
       "Still going at " + hours + "h. Future you says thanks.",
-      hours + " hours in. Hunger's just a suggestion at this point.",
+      hours + (hours === 1 ? " hour" : " hours") + " in. Hunger's just a suggestion at this point.",
       "Clocked " + hours + "h fasting. Cells are taking notes for the cleanup crew.",
-      hours + "h down, " + targetHours + "h to go. Onward."
+      remaining > 0
+        ? hours + "h down, " + remaining + "h to go. Onward."
+        : hours + "h down, past the target and still going. Onward."
     ]
   }
 
