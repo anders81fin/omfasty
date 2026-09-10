@@ -6,15 +6,20 @@ Usage:
   fasting-cli.py target <hours>    change the target of an in-progress fast
   fasting-cli.py stop              end the current fast, log it to history
   fasting-cli.py status            print current state + streak + history as JSON
+  fasting-cli.py nudge <kind> <hour> <title> <body>
+                                   send an hourly nudge, at most once per hour
 """
 import json
 import os
+import subprocess
 import sys
 import time
 
 STATE_DIR = os.path.expanduser("~/.local/state/omarchy-fasting")
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
 HISTORY_FILE = os.path.join(STATE_DIR, "history.jsonl")
+NUDGE_DIR = os.path.join(STATE_DIR, "nudges")
+NUDGE_KEEP_SECONDS = 172800
 RECENT_COUNT = 3
 RECENT_MIN_HOURS = 12.0
 LONGEST_COUNT = 3
@@ -132,6 +137,48 @@ def cmd_status():
     }))
 
 
+def prune_nudges(now):
+    for name in os.listdir(NUDGE_DIR):
+        path = os.path.join(NUDGE_DIR, name)
+        try:
+            if now - os.path.getmtime(path) > NUDGE_KEEP_SECONDS:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def cmd_nudge(kind, hour, title, body):
+    """Send an hourly nudge, but only the first caller to ask for this hour.
+
+    The bar is instantiated once per monitor, so on a multi-monitor desktop
+    several copies of the widget reach this point at the same whole hour and
+    would otherwise each send the same notification. Creating the marker with
+    O_CREAT|O_EXCL is the arbiter: exactly one caller creates it, the rest
+    lose the race and return quietly.
+    """
+    os.makedirs(NUDGE_DIR, exist_ok=True)
+
+    state = load_state()
+    if kind == "fast":
+        anchor = state["startedAt"]
+    else:
+        entries = read_history()
+        anchor = entries[-1].get("end", 0) if entries else 0
+
+    marker = os.path.join(NUDGE_DIR, "%s-%d-%d" % (kind, anchor, hour))
+    try:
+        os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+    except FileExistsError:
+        return
+
+    prune_nudges(time.time())
+
+    try:
+        subprocess.run(["notify-send", "-a", "omfasty", title, body], check=False)
+    except (OSError, FileNotFoundError):
+        pass
+
+
 def parse_hours(argv, index, default=DEFAULT_TARGET_HOURS):
     if len(argv) > index:
         try:
@@ -155,6 +202,15 @@ def main():
         cmd_stop()
     elif cmd == "status":
         cmd_status()
+    elif cmd == "nudge":
+        if len(argv) < 5:
+            sys.stderr.write("usage: nudge <kind> <hour> <title> <body>\n")
+            sys.exit(1)
+        try:
+            hour = int(argv[2])
+        except ValueError:
+            sys.exit(1)
+        cmd_nudge(argv[1], hour, argv[3], argv[4])
     else:
         sys.stderr.write("unknown command: %s\n" % cmd)
         sys.exit(1)

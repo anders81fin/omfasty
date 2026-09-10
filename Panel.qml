@@ -120,8 +120,12 @@ Panel {
     return list[Math.floor(Math.random() * list.length)]
   }
 
-  function notify(title, body) {
-    notifyProc.command = ["notify-send", "-a", "omfasty", title, body]
+  // Routed through the CLI rather than calling notify-send directly. The bar
+  // is instantiated once per monitor, so on a multi-monitor desktop every copy
+  // of this widget reaches the same whole hour at the same moment; the CLI
+  // claims the hour so only one of them actually sends anything.
+  function notify(kind, hour, title, body) {
+    notifyProc.command = [root.scriptPath(), "nudge", kind, String(hour), title, body]
     notifyProc.running = true
   }
 
@@ -208,13 +212,13 @@ Panel {
         var fh = Math.floor(root.elapsedHours)
         if (fh > root.lastNotifiedFastHour) {
           root.lastNotifiedFastHour = fh
-          root.notify("omfasty — " + fh + "h fasting", root.randomOf(root.fastHourMessages(fh)))
+          root.notify("fast", fh, "omfasty — " + fh + "h fasting", root.randomOf(root.fastHourMessages(fh)))
         }
       } else if (root.hasEatingHistory) {
         var eh = Math.floor(root.eatingElapsedHours)
         if (eh > root.lastNotifiedEatingHour) {
           root.lastNotifiedEatingHour = eh
-          root.notify("omfasty — " + eh + "h eating", root.randomOf(root.eatingHourMessages(eh)))
+          root.notify("eating", eh, "omfasty — " + eh + "h eating", root.randomOf(root.eatingHourMessages(eh)))
         }
       }
     }
