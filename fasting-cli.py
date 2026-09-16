@@ -4,7 +4,11 @@
 Usage:
   fasting-cli.py start <hours>     start a fast (no-op if already fasting)
   fasting-cli.py target <hours>    change the target of an in-progress fast
-  fasting-cli.py stop              end the current fast, log it to history
+  fasting-cli.py stop              end the current fast, log it to history,
+                                   and open the eating window
+  fasting-cli.py idle              stop whatever is counting WITHOUT logging
+                                   anything: discards a running fast, or closes
+                                   the eating window
   fasting-cli.py status            print current state + streak + history as JSON
   fasting-cli.py nudge <kind> <hour> <title> <body>
                                    send an hourly nudge, at most once per hour
@@ -34,9 +38,21 @@ def load_state():
             "fasting": bool(data.get("fasting", False)),
             "startedAt": int(data.get("startedAt", 0)),
             "targetHours": float(data.get("targetHours", DEFAULT_TARGET_HOURS)),
+            # Nothing is counting: neither a fast nor the eating window. Absent
+            # from state files written before this flag existed, and defaulting
+            # to False there is what keeps their eating window running as it
+            # did rather than silently stopping on upgrade.
+            "idle": bool(data.get("idle", False)),
         }
     except (FileNotFoundError, ValueError, json.JSONDecodeError):
-        return {"fasting": False, "startedAt": 0, "targetHours": DEFAULT_TARGET_HOURS}
+        return {
+            "fasting": False,
+            "startedAt": 0,
+            "targetHours": DEFAULT_TARGET_HOURS,
+            # A first run has no eating window to continue, so it starts idle
+            # instead of counting up from a lastEnd it does not have.
+            "idle": True,
+        }
 
 
 def save_state(state):
@@ -95,6 +111,7 @@ def cmd_start(hours):
         state["fasting"] = True
         state["startedAt"] = int(time.time())
         state["targetHours"] = hours
+        state["idle"] = False
         save_state(state)
     cmd_status()
 
@@ -119,7 +136,26 @@ def cmd_stop():
         })
         state["fasting"] = False
         state["startedAt"] = 0
+        # Ending a fast is what opens the eating window, so this is the one
+        # transition that deliberately leaves idle off.
+        state["idle"] = False
         save_state(state)
+    cmd_status()
+
+
+def cmd_idle():
+    """Stop the counter without logging anything.
+
+    Two situations, one outcome: a running fast is discarded (it never reaches
+    history, so a mistaken start cannot pad the streak), and an open eating
+    window is simply closed. Either way nothing counts afterwards until the
+    user starts the next fast.
+    """
+    state = load_state()
+    state["fasting"] = False
+    state["startedAt"] = 0
+    state["idle"] = True
+    save_state(state)
     cmd_status()
 
 
@@ -130,6 +166,7 @@ def cmd_status():
         "fasting": state["fasting"],
         "startedAt": state["startedAt"],
         "targetHours": state["targetHours"],
+        "idle": state["idle"],
         "streak": compute_streak(entries),
         "lastEnd": entries[-1]["end"] if entries else 0,
         "history": recent_long_fasts(entries),
@@ -159,6 +196,14 @@ def cmd_nudge(kind, hour, title, body):
     os.makedirs(NUDGE_DIR, exist_ok=True)
 
     state = load_state()
+
+    # A nudge in flight can outlive the thing it was about: the widget queues
+    # it from a 1s tick, and the user may stop the counter in between. Checking
+    # here rather than trusting the caller also covers the second bar instance
+    # on a multi-monitor desktop, which may not have seen the new state yet.
+    if state["idle"] or (kind == "fast" and not state["fasting"]):
+        return
+
     if kind == "fast":
         anchor = state["startedAt"]
     else:
@@ -200,6 +245,8 @@ def main():
         cmd_target(parse_hours(argv, 1))
     elif cmd == "stop":
         cmd_stop()
+    elif cmd == "idle":
+        cmd_idle()
     elif cmd == "status":
         cmd_status()
     elif cmd == "nudge":
