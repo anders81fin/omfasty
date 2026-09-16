@@ -15,25 +15,172 @@ Usage:
 """
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
 
 STATE_DIR = os.path.expanduser("~/.local/state/omarchy-fasting")
-STATE_FILE = os.path.join(STATE_DIR, "state.json")
-HISTORY_FILE = os.path.join(STATE_DIR, "history.jsonl")
-NUDGE_DIR = os.path.join(STATE_DIR, "nudges")
+STATE_NAME = "state.json"
+HISTORY_NAME = "history.jsonl"
+NUDGE_NAME = "nudges"
 NUDGE_KEEP_SECONDS = 172800
+NUDGE_KINDS = ("fast", "eating")
 RECENT_COUNT = 3
 RECENT_MIN_HOURS = 12.0
 LONGEST_COUNT = 3
 DEFAULT_TARGET_HOURS = 16.0
 
+# Reads are bounded so a state directory that has grown (or been made to grow)
+# cannot pull an unbounded amount into memory. The history cap is generous --
+# roughly fifty thousand fasts -- and past it only the newest entries are kept,
+# which is the end the streak, the eating-window anchor and the recent list all
+# read from anyway.
+MAX_STATE_BYTES = 64 * 1024
+MAX_HISTORY_BYTES = 4 * 1024 * 1024
+
+
+# --------------------------------------------------------------------------
+# Filesystem access
+#
+# Everything below goes through a single descriptor for the state directory,
+# opened once with O_NOFOLLOW and checked with fstat, and every file is then
+# reached *relative to that descriptor* rather than by path. Paths are resolved
+# afresh on each syscall and can change underneath the process; a descriptor
+# cannot. Without this, a symlink planted in the state directory would be
+# followed by the writes here -- and by the nudge cleanup, which deletes.
+# --------------------------------------------------------------------------
+
+_state_dir_fd = None
+
+
+class StateDirError(Exception):
+    """The state directory is not something we are willing to write into."""
+
+
+def state_dir_fd():
+    global _state_dir_fd
+    if _state_dir_fd is None:
+        _state_dir_fd = _open_private_dir(STATE_DIR)
+    return _state_dir_fd
+
+
+def _open_private_dir(path, parent_fd=None):
+    """Open a directory we own and only we can read, creating it if needed.
+
+    O_NOFOLLOW refuses a symlink in place of the directory itself; O_DIRECTORY
+    refuses a regular file. Ownership is then checked against the real uid, and
+    group/other permissions are stripped -- the contents are a health log, and
+    early versions created this directory with the process umask.
+    """
+    try:
+        if parent_fd is None:
+            os.makedirs(path, mode=0o700, exist_ok=True)
+        else:
+            os.mkdir(path, 0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError as e:
+        raise StateDirError("cannot open %s safely: %s" % (path, e))
+
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid():
+            raise StateDirError("%s is owned by uid %d, not you" % (path, st.st_uid))
+        if st.st_mode & 0o077:
+            os.fchmod(fd, 0o700)
+    except Exception:
+        os.close(fd)
+        raise
+
+    return fd
+
+
+def _read_bounded(dir_fd, name, limit, tail=False):
+    """Read at most `limit` bytes from a regular file, or b"" if there isn't one.
+
+    A symlink, a directory or a fifo in place of the file reads as empty rather
+    than raising, which lands on the same "fall back to defaults" path that a
+    corrupt file has always taken.
+    """
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except OSError:
+        return b""
+
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            return b""
+        if tail and st.st_size > limit:
+            os.lseek(f.fileno(), st.st_size - limit, os.SEEK_SET)
+            data = f.read(limit)
+            # The seek almost certainly landed mid-line; drop that fragment.
+            cut = data.find(b"\n")
+            return data[cut + 1:] if cut >= 0 else b""
+        return f.read(limit)
+
+
+def _write_atomic(dir_fd, name, data):
+    """Replace a file by writing a fresh temp beside it and renaming over it.
+
+    O_EXCL means an existing temp -- including one someone else planted as a
+    symlink -- is an error rather than a target, and the rename is
+    descriptor-relative on both ends so neither path is re-resolved.
+    """
+    tmp = name + ".tmp"
+    try:
+        os.unlink(tmp, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+
+    fd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=dir_fd,
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+
+    os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+
+
+def _append_line(dir_fd, name, line):
+    fd = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=dir_fd,
+    )
+    with os.fdopen(fd, "ab") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise StateDirError("%s is not a regular file" % name)
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
+
 
 def load_state():
     try:
-        with open(STATE_FILE) as f:
-            data = json.load(f)
+        raw = _read_bounded(state_dir_fd(), STATE_NAME, MAX_STATE_BYTES)
+        if not raw:
+            raise FileNotFoundError
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("state is not an object")
         return {
             "fasting": bool(data.get("fasting", False)),
             "startedAt": int(data.get("startedAt", 0)),
@@ -56,32 +203,26 @@ def load_state():
 
 
 def save_state(state):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    tmp = STATE_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f)
-    os.replace(tmp, STATE_FILE)
+    _write_atomic(state_dir_fd(), STATE_NAME, json.dumps(state).encode("utf-8"))
 
 
 def append_history(entry):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    with open(HISTORY_FILE, "a") as f:
-        f.write(json.dumps(entry) + "\n")
+    _append_line(state_dir_fd(), HISTORY_NAME, (json.dumps(entry) + "\n").encode("utf-8"))
 
 
 def read_history():
-    if not os.path.exists(HISTORY_FILE):
-        return []
+    raw = _read_bounded(state_dir_fd(), HISTORY_NAME, MAX_HISTORY_BYTES, tail=True)
     entries = []
-    with open(HISTORY_FILE) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                entries.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
     return entries
 
 
@@ -174,12 +315,22 @@ def cmd_status():
     }))
 
 
-def prune_nudges(now):
-    for name in os.listdir(NUDGE_DIR):
-        path = os.path.join(NUDGE_DIR, name)
+def prune_nudges(nudge_fd, now):
+    """Delete stale hour markers.
+
+    This is the one place that removes files, so it is the one that most needs
+    to be descriptor-relative: lstat and unlink both run against the directory
+    descriptor, and anything that is not a plain file is left alone rather than
+    followed. A symlink here would previously have been stat'd and deleted
+    through, letting the marker directory act as a lever on any path.
+    """
+    for name in os.listdir(nudge_fd):
         try:
-            if now - os.path.getmtime(path) > NUDGE_KEEP_SECONDS:
-                os.remove(path)
+            st = os.stat(name, dir_fd=nudge_fd, follow_symlinks=False)
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            if now - st.st_mtime > NUDGE_KEEP_SECONDS:
+                os.unlink(name, dir_fd=nudge_fd)
         except OSError:
             pass
 
@@ -193,7 +344,11 @@ def cmd_nudge(kind, hour, title, body):
     O_CREAT|O_EXCL is the arbiter: exactly one caller creates it, the rest
     lose the race and return quietly.
     """
-    os.makedirs(NUDGE_DIR, exist_ok=True)
+    # The marker name is built from `kind`, which arrives on the command line.
+    # Constraining it to the two kinds this tool knows keeps a separator or a
+    # ".." out of the name before it is ever handed to open().
+    if kind not in NUDGE_KINDS:
+        return
 
     state = load_state()
 
@@ -210,13 +365,22 @@ def cmd_nudge(kind, hour, title, body):
         entries = read_history()
         anchor = entries[-1].get("end", 0) if entries else 0
 
-    marker = os.path.join(NUDGE_DIR, "%s-%d-%d" % (kind, anchor, hour))
+    nudge_fd = _open_private_dir(NUDGE_NAME, parent_fd=state_dir_fd())
     try:
-        os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
-    except FileExistsError:
-        return
+        marker = "%s-%d-%d" % (kind, anchor, hour)
+        try:
+            os.close(os.open(
+                marker,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=nudge_fd,
+            ))
+        except FileExistsError:
+            return
 
-    prune_nudges(time.time())
+        prune_nudges(nudge_fd, time.time())
+    finally:
+        os.close(nudge_fd)
 
     try:
         subprocess.run(["notify-send", "-a", "omfasty", title, body], check=False)
@@ -264,4 +428,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # A state directory we refuse to touch is a real failure, not a crash to
+    # bury: say so on stderr and exit non-zero. The widget reads stdout only,
+    # so it simply keeps its last known state rather than rendering a traceback.
+    try:
+        main()
+    except StateDirError as e:
+        sys.stderr.write("fasting-cli: %s\n" % e)
+        sys.exit(1)

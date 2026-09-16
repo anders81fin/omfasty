@@ -30,7 +30,9 @@ Or by hand: drop this folder into `~/.config/omarchy/plugins/anders81fin.omfasty
 
 ## How it works
 
-State lives outside the shell, in `fasting-cli.py` (a small Python script writing to `~/.local/state/omarchy-fasting/`), so it survives shell restarts and stays simple to inspect or edit by hand. The QML side (`Panel.qml`) just shells out to it and renders the result, and calls `notify-send` directly for the hourly nudges.
+State lives outside the shell, in `fasting-cli.py` (a small Python script writing to `~/.local/state/omarchy-fasting/`), so it survives shell restarts and stays simple to inspect or edit by hand.
+
+That directory is created `0700` and is tightened to `0700` if it is looser, since it holds a health log. The script opens it once as a descriptor it has checked with `fstat` — owned by you, not a symlink — and every read, write and delete afterwards is made relative to that descriptor rather than by path, so nothing in there can be turned into a lever on a file elsewhere. `python3 test-fasting-cli.py` covers this along with the ordinary start/stop behaviour; it needs no dependencies and no test runner. The QML side (`Panel.qml`) just shells out to it and renders the result, and calls `notify-send` directly for the hourly nudges.
 
 ## License
 
