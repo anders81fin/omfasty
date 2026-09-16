@@ -38,6 +38,10 @@ Panel {
   readonly property bool showBan: fasting && !targetReached
 
   property bool fasting: false
+  // Nothing is counting. Distinct from "no history yet": the user can stop the
+  // clock at any point and land back here, so this cannot be derived from
+  // lastEnd alone.
+  property bool idle: true
   property int startedAt: 0
   property real targetHours: 16
   property int streak: 0
@@ -59,7 +63,7 @@ Panel {
   readonly property bool targetReached: fasting && elapsedHours >= targetHours
 
   readonly property real eatingTargetHours: Math.max(0, 24 - targetHours)
-  readonly property bool hasEatingHistory: !fasting && lastEnd > 0
+  readonly property bool hasEatingHistory: !fasting && !idle && lastEnd > 0
   readonly property real eatingElapsedHours: hasEatingHistory ? Math.max(0, (nowEpoch - lastEnd) / 3600) : 0
 
   function formatHm(hours) {
@@ -160,6 +164,7 @@ Panel {
     try { data = JSON.parse(json) } catch (e) { return }
     if (!data) return
     root.fasting = !!data.fasting
+    root.idle = !!data.idle
     root.startedAt = data.startedAt || 0
     root.targetHours = data.targetHours || 16
     root.streak = data.streak || 0
@@ -184,6 +189,15 @@ Panel {
     startProc.running = true
   }
 
+  // Stop the clock without recording anything — discards a running fast, or
+  // closes the eating window. Deliberately not wired to the primary button:
+  // ending a fast should stay the easy path, and losing a 20h fast to a
+  // mis-tap should not.
+  function stopCounter() {
+    startProc.command = [root.scriptPath(), "idle"]
+    startProc.running = true
+  }
+
   Component.onCompleted: refresh()
 
   onOpenedChanged: if (opened) refresh()
@@ -195,6 +209,13 @@ Panel {
   // per hour already elapsed.
   onStartedAtChanged: lastNotifiedFastHour = fasting ? Math.floor(elapsedHours) : 0
   onLastEndChanged: lastNotifiedEatingHour = hasEatingHistory ? Math.floor(eatingElapsedHours) : 0
+  // Leaving idle can hand the eating window a hours-old anchor without lastEnd
+  // itself changing, so reseed here too or the next tick replays every hour of
+  // it as a notification.
+  onIdleChanged: {
+    lastNotifiedFastHour = fasting ? Math.floor(elapsedHours) : 0
+    lastNotifiedEatingHour = hasEatingHistory ? Math.floor(eatingElapsedHours) : 0
+  }
 
   // Live 1s tick drives both the fasting countup and the eating-window
   // countup; the CLI round-trip only happens on open, on actions, and every
@@ -548,16 +569,48 @@ Panel {
             foreground: root.bar.foreground
           }
 
-          Button {
+          // Primary action plus, whenever something is actually counting, a
+          // narrower way out that records nothing. In the idle state there is
+          // nothing to stop, so the primary button takes the full width and
+          // the row looks exactly as it did before this feature existed.
+          Row {
+            id: actionRow
             width: parent.width
-            text: root.fasting ? "End fast" : "Start fast (" + root.targetHours + "h)"
-            fontSize: Style.font.body
-            foreground: root.bar.foreground
-            fontFamily: root.bar.fontFamily
-            horizontalPadding: Style.spacing.controlPaddingX
-            verticalPadding: Style.spacing.controlPaddingY
-            bordered: true
-            onClicked: root.fasting ? root.stop() : root.start(root.targetHours)
+            spacing: Style.spacing.xs
+
+            readonly property bool counting: root.fasting || root.hasEatingHistory
+            readonly property real stopWidth: Math.round(width * 0.34)
+
+            Button {
+              width: actionRow.counting
+                ? actionRow.width - actionRow.stopWidth - actionRow.spacing
+                : actionRow.width
+              text: root.fasting ? "End fast" : "Start fast (" + root.targetHours + "h)"
+              fontSize: Style.font.body
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              horizontalPadding: Style.spacing.controlPaddingX
+              verticalPadding: Style.spacing.controlPaddingY
+              bordered: true
+              onClicked: root.fasting ? root.stop() : root.start(root.targetHours)
+            }
+
+            // "Discard" while fasting, because that is what it does to the
+            // fast; "Stop" during the eating window, where there is nothing to
+            // throw away.
+            Button {
+              visible: actionRow.counting
+              width: actionRow.stopWidth
+              text: root.fasting ? "Discard" : "Stop"
+              fontSize: Style.font.body
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              horizontalPadding: Style.spacing.sm
+              verticalPadding: Style.spacing.controlPaddingY
+              bordered: true
+              opacity: 0.75
+              onClicked: root.stopCounter()
+            }
           }
 
           // ---------- History ----------

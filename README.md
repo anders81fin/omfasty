@@ -9,6 +9,7 @@ An intermittent-fasting timer for the [Omarchy](https://omarchy.org) shell bar. 
 - **Bar pill** showing elapsed time next to an icon that changes with state: utensils while eating, utensils struck through while fasting, a checkmark once the target is hit.
 - **Fasting : eating ratio presets** — 14:10, 16:8, 18:6, 20:4, 22:2, and UMAD? (24:0, the joke option).
 - **Eating-window tracking** — once a fast ends, the same pill counts up the time since, against the eating-window target implied by the ratio you picked (`24 - fasting hours`).
+- **Stop whenever you like** — the clock is not a one-way street. "Discard" abandons a running fast without writing it to history (so a mistaken start cannot pad your streak), and "Stop" closes the eating window. Either leaves the pill quiet until you start the next fast.
 - **Progress bar** and a **streak counter** for fasts that hit their target.
 - **Physiology-stage commentary** — a tongue-in-cheek line that updates through the fast (blood sugar, glycogen, the metabolic switch, ketosis, autophagy) and through the eating window (fueling up, window closing, into overtime). Not medical advice — it's a bar widget, not a lab.
 - **Recent history** — the last three completed fasts of at least 12h, with actual vs. target hours.
@@ -16,6 +17,8 @@ An intermittent-fasting timer for the [Omarchy](https://omarchy.org) shell bar. 
 - **Hourly nudges** — a desktop notification every hour on the clock, both while fasting (a short encouragement) and during the eating window (a reminder to eat before the next fast starts). Requires `notify-send` and a running notification daemon; silently skipped if neither is available.
 
 Click the bar pill to open the popup; pick a ratio, then "Start fast" to begin. The ratio presets lock once a fast is running — end the fast to pick a different target.
+
+"End fast" is the normal way to finish: it records the fast and opens the eating window. The narrower button beside it never records anything — it reads "Discard" during a fast and "Stop" during the eating window, and both stop the clock entirely.
 
 ## Installing
 
