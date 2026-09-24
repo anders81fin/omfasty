@@ -14,7 +14,9 @@ Usage:
                                    send an hourly nudge, at most once per hour
 """
 import json
+import math
 import os
+import pwd
 import stat
 import subprocess
 import sys
@@ -40,6 +42,18 @@ DEFAULT_TARGET_HOURS = 16.0
 # read from anyway.
 MAX_STATE_BYTES = 64 * 1024
 MAX_HISTORY_BYTES = 4 * 1024 * 1024
+
+# Numbers from the command line and from disk are held to these before they are
+# stored or printed. NaN and infinity in particular must never reach the JSON:
+# Python writes them as bare NaN/Infinity, which QML's JSON.parse rejects, and
+# the widget would then stop reading state altogether.
+MAX_TARGET_HOURS = 24.0 * 14
+MAX_TIMESTAMP = 2 ** 53
+MAX_NUDGE_HOUR = 24 * 365
+
+# notify-send by absolute path, so the nudge does not run whatever a PATH
+# entry happens to provide under that name. First one that exists wins.
+NOTIFY_SEND_PATHS = ("/usr/bin/notify-send", "/bin/notify-send")
 
 
 # --------------------------------------------------------------------------
@@ -72,14 +86,16 @@ def state_dir_fd():
 def _open_state_dir():
     """Walk from $HOME to the state directory, one descriptor at a time.
 
-    $HOME itself is the trusted root: it is opened by path (it may legitimately
-    be a symlink, e.g. into /var/home) but must be owned by us. Every component
+    The home directory is the trusted root. It comes from the password database
+    rather than $HOME, which is only an environment variable; it is opened by
+    path (it may legitimately be a symlink, e.g. into /var/home) but must be
+    owned by us. Every component
     below it is created and opened relative to its parent's descriptor, so a
     symlink or a swapped directory anywhere along ~/.local/state is refused
     rather than followed. Only the final directory is made private; the shared
     XDG ancestors keep whatever permissions they already have.
     """
-    home = os.path.expanduser("~")
+    home = _home_dir()
     try:
         fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
     except OSError as e:
@@ -100,6 +116,16 @@ def _open_state_dir():
             os.close(fd)
         fd = child
     return fd
+
+
+def _home_dir():
+    try:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        home = ""
+    if not home:
+        raise StateDirError("no home directory for uid %d" % os.getuid())
+    return home
 
 
 def _open_owned_dir(name, parent_fd, path=None, private=True):
@@ -142,22 +168,46 @@ def _check_owner(fd, path):
     return st
 
 
+def _open_regular(dir_fd, name, flags, mode=0o600):
+    """Open `name` under `dir_fd` only if it is a plain, singly-linked file.
+
+    O_NOFOLLOW refuses a symlink. O_NONBLOCK keeps a fifo planted in place of
+    the file from blocking the open forever -- the S_ISREG check below would
+    otherwise never be reached -- and is cleared again once the file is known to
+    be regular. A second hard link means the same inode is reachable from
+    outside the state directory, which O_NOFOLLOW cannot see, so that is
+    refused too. Raises StateDirError.
+    """
+    try:
+        fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, mode, dir_fd=dir_fd)
+    except OSError as e:
+        raise StateDirError("cannot open %s safely: %s" % (name, e))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise StateDirError("%s is not a regular file" % name)
+        if st.st_nlink != 1:
+            raise StateDirError("%s has %d hard links" % (name, st.st_nlink))
+        os.set_blocking(fd, True)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd, st
+
+
 def _read_bounded(dir_fd, name, limit, tail=False):
     """Read at most `limit` bytes from a regular file, or b"" if there isn't one.
 
-    A symlink, a directory or a fifo in place of the file reads as empty rather
-    than raising, which lands on the same "fall back to defaults" path that a
-    corrupt file has always taken.
+    Anything _open_regular refuses reads as empty rather than raising, which
+    lands on the same "fall back to defaults" path that a corrupt file has
+    always taken.
     """
     try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
-    except OSError:
+        fd, st = _open_regular(dir_fd, name, os.O_RDONLY)
+    except StateDirError:
         return b""
 
     with os.fdopen(fd, "rb") as f:
-        st = os.fstat(f.fileno())
-        if not stat.S_ISREG(st.st_mode):
-            return b""
         if tail and st.st_size > limit:
             os.lseek(f.fileno(), st.st_size - limit, os.SEEK_SET)
             data = f.read(limit)
@@ -172,14 +222,13 @@ def _write_atomic(dir_fd, name, data):
 
     O_EXCL means an existing temp -- including one someone else planted as a
     symlink -- is an error rather than a target, and the rename is
-    descriptor-relative on both ends so neither path is re-resolved.
+    descriptor-relative on both ends so neither path is re-resolved. The temp
+    name is unique per call: with one bar per monitor, two writers can run at
+    once, and a shared name had each deleting the other's temp mid-write. The
+    directory is fsynced after the rename so the new entry itself survives a
+    power cut, not just the file's contents.
     """
-    tmp = name + ".tmp"
-    try:
-        os.unlink(tmp, dir_fd=dir_fd)
-    except FileNotFoundError:
-        pass
-
+    tmp = "%s.%d.%s.tmp" % (name, os.getpid(), os.urandom(4).hex())
     fd = os.open(
         tmp,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -198,22 +247,42 @@ def _write_atomic(dir_fd, name, data):
             pass
         raise
 
-    os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    try:
+        os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    except Exception:
+        try:
+            os.unlink(tmp, dir_fd=dir_fd)
+        except OSError:
+            pass
+        raise
+    os.fsync(dir_fd)
 
 
 def _append_line(dir_fd, name, line):
-    fd = os.open(
-        name,
-        os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
-        0o600,
-        dir_fd=dir_fd,
-    )
+    fd, _ = _open_regular(dir_fd, name, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
     with os.fdopen(fd, "ab") as f:
-        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
-            raise StateDirError("%s is not a regular file" % name)
         f.write(line)
         f.flush()
         os.fsync(f.fileno())
+
+
+def _number(value, low, high):
+    """`value` as a float if it is a finite JSON number in [low, high], else None.
+
+    bool is excluded explicitly: it is an int subclass, and `true` is not an
+    hour count.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if not math.isfinite(value) or not low <= value <= high:
+        return None
+    return value
+
+
+def _target_hours(value):
+    hours = _number(value, 0.0, MAX_TARGET_HOURS)
+    return hours if hours and hours > 0 else DEFAULT_TARGET_HOURS
 
 
 def load_state():
@@ -224,17 +293,18 @@ def load_state():
         data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("state is not an object")
+        started = _number(data.get("startedAt", 0), 0, MAX_TIMESTAMP)
         return {
             "fasting": bool(data.get("fasting", False)),
-            "startedAt": int(data.get("startedAt", 0)),
-            "targetHours": float(data.get("targetHours", DEFAULT_TARGET_HOURS)),
+            "startedAt": int(started) if started is not None else 0,
+            "targetHours": _target_hours(data.get("targetHours", DEFAULT_TARGET_HOURS)),
             # Nothing is counting: neither a fast nor the eating window. Absent
             # from state files written before this flag existed, and defaulting
             # to False there is what keeps their eating window running as it
             # did rather than silently stopping on upgrade.
             "idle": bool(data.get("idle", False)),
         }
-    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+    except (FileNotFoundError, ValueError, RecursionError):
         return {
             "fasting": False,
             "startedAt": 0,
@@ -253,6 +323,23 @@ def append_history(entry):
     _append_line(state_dir_fd(), HISTORY_NAME, (json.dumps(entry) + "\n").encode("utf-8"))
 
 
+def _history_entry(entry):
+    """The four fields stop() writes, as finite numbers, or None to skip the line.
+
+    Only these fields are passed on: the widget formats them with toFixed()
+    and Date(), and anything else in the file has no business reaching it.
+    """
+    if not isinstance(entry, dict):
+        return None
+    start = _number(entry.get("start"), 0, MAX_TIMESTAMP)
+    end = _number(entry.get("end"), 0, MAX_TIMESTAMP)
+    target = _number(entry.get("targetHours"), 0.0, MAX_TARGET_HOURS)
+    actual = _number(entry.get("actualHours"), 0.0, MAX_TIMESTAMP / 3600.0)
+    if None in (start, end, target, actual):
+        return None
+    return {"start": int(start), "end": int(end), "targetHours": target, "actualHours": actual}
+
+
 def read_history():
     raw = _read_bounded(state_dir_fd(), HISTORY_NAME, MAX_HISTORY_BYTES, tail=True)
     entries = []
@@ -261,10 +348,10 @@ def read_history():
         if not line:
             continue
         try:
-            entry = json.loads(line)
-        except json.JSONDecodeError:
+            entry = _history_entry(json.loads(line))
+        except (ValueError, RecursionError):
             continue
-        if isinstance(entry, dict):
+        if entry is not None:
             entries.append(entry)
     return entries
 
@@ -392,6 +479,9 @@ def cmd_nudge(kind, hour, title, body):
     # ".." out of the name before it is ever handed to open().
     if kind not in NUDGE_KINDS:
         return
+    # The hour goes into the same name; bounded, it cannot outgrow NAME_MAX.
+    if not 0 <= hour <= MAX_NUDGE_HOUR:
+        return
 
     state = load_state()
 
@@ -425,19 +515,28 @@ def cmd_nudge(kind, hour, title, body):
     finally:
         os.close(nudge_fd)
 
+    notify_send = next((p for p in NOTIFY_SEND_PATHS if os.access(p, os.X_OK)), None)
+    if notify_send is None:
+        return
     try:
-        subprocess.run(["notify-send", "-a", "omfasty", title, body], check=False)
-    except (OSError, FileNotFoundError):
+        # "--" so a title or body starting with "-" is text, not an option.
+        subprocess.run([notify_send, "-a", "omfasty", "--", title, body], check=False)
+    except OSError:
         pass
 
 
-def parse_hours(argv, index, default=DEFAULT_TARGET_HOURS):
+def parse_hours(argv, index):
+    """The hour count at argv[index]; the default if missing or not a sane number.
+
+    float() alone accepts "nan" and "inf", which is how a NaN target reached
+    the state file.
+    """
     if len(argv) > index:
         try:
-            return float(argv[index])
+            return _target_hours(float(argv[index]))
         except ValueError:
             pass
-    return default
+    return DEFAULT_TARGET_HOURS
 
 
 def main():
@@ -470,7 +569,7 @@ def main():
         sys.exit(1)
 
 
-if __name__ == "__main__":
+def run():
     # A state directory we refuse to touch is a real failure, not a crash to
     # bury: say so on stderr and exit non-zero. The widget reads stdout only,
     # so it simply keeps its last known state rather than rendering a traceback.
@@ -479,3 +578,7 @@ if __name__ == "__main__":
     except StateDirError as e:
         sys.stderr.write("fasting-cli: %s\n" % e)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    run()
