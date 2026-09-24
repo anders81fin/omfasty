@@ -20,7 +20,9 @@ import subprocess
 import sys
 import time
 
-STATE_DIR = os.path.expanduser("~/.local/state/omarchy-fasting")
+# The state directory, as components below $HOME. It is reached one component
+# at a time from a descriptor for $HOME, never as a single path -- see below.
+STATE_DIR_PARTS = (".local", "state", "omarchy-fasting")
 STATE_NAME = "state.json"
 HISTORY_NAME = "history.jsonl"
 NUDGE_NAME = "nudges"
@@ -44,7 +46,9 @@ MAX_HISTORY_BYTES = 4 * 1024 * 1024
 # Filesystem access
 #
 # Everything below goes through a single descriptor for the state directory,
-# opened once with O_NOFOLLOW and checked with fstat, and every file is then
+# reached by walking down from $HOME one component at a time -- each opened
+# relative to the previous one with O_NOFOLLOW and checked with fstat, so no
+# ancestor can be a symlink or be swapped out mid-walk -- and every file is then
 # reached *relative to that descriptor* rather than by path. Paths are resolved
 # afresh on each syscall and can change underneath the process; a descriptor
 # cannot. Without this, a symlink planted in the state directory would be
@@ -61,42 +65,81 @@ class StateDirError(Exception):
 def state_dir_fd():
     global _state_dir_fd
     if _state_dir_fd is None:
-        _state_dir_fd = _open_private_dir(STATE_DIR)
+        _state_dir_fd = _open_state_dir()
     return _state_dir_fd
 
 
-def _open_private_dir(path, parent_fd=None):
-    """Open a directory we own and only we can read, creating it if needed.
+def _open_state_dir():
+    """Walk from $HOME to the state directory, one descriptor at a time.
 
-    O_NOFOLLOW refuses a symlink in place of the directory itself; O_DIRECTORY
-    refuses a regular file. Ownership is then checked against the real uid, and
-    group/other permissions are stripped -- the contents are a health log, and
-    early versions created this directory with the process umask.
+    $HOME itself is the trusted root: it is opened by path (it may legitimately
+    be a symlink, e.g. into /var/home) but must be owned by us. Every component
+    below it is created and opened relative to its parent's descriptor, so a
+    symlink or a swapped directory anywhere along ~/.local/state is refused
+    rather than followed. Only the final directory is made private; the shared
+    XDG ancestors keep whatever permissions they already have.
     """
+    home = os.path.expanduser("~")
     try:
-        if parent_fd is None:
-            os.makedirs(path, mode=0o700, exist_ok=True)
-        else:
-            os.mkdir(path, 0o700, dir_fd=parent_fd)
+        fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as e:
+        raise StateDirError("cannot open %s safely: %s" % (home, e))
+    try:
+        _check_owner(fd, home)
+    except Exception:
+        os.close(fd)
+        raise
+
+    path = home
+    last = len(STATE_DIR_PARTS) - 1
+    for i, name in enumerate(STATE_DIR_PARTS):
+        path = os.path.join(path, name)
+        try:
+            child = _open_owned_dir(name, fd, path, private=(i == last))
+        finally:
+            os.close(fd)
+        fd = child
+    return fd
+
+
+def _open_owned_dir(name, parent_fd, path=None, private=True):
+    """Open directory `name` under `parent_fd`, creating it if needed.
+
+    O_NOFOLLOW refuses a symlink in place of the directory; O_DIRECTORY refuses
+    a regular file. Ownership is then checked against the real uid. With
+    `private`, group/other permissions are stripped -- the contents are a health
+    log, and early versions created the state directory with the process umask.
+    `path` is only used in error messages.
+    """
+    path = path or name
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
     except FileExistsError:
         pass
+    except OSError as e:
+        raise StateDirError("cannot create %s: %s" % (path, e))
 
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
     except OSError as e:
         raise StateDirError("cannot open %s safely: %s" % (path, e))
 
     try:
-        st = os.fstat(fd)
-        if st.st_uid != os.getuid():
-            raise StateDirError("%s is owned by uid %d, not you" % (path, st.st_uid))
-        if st.st_mode & 0o077:
+        st = _check_owner(fd, path)
+        if private and st.st_mode & 0o077:
             os.fchmod(fd, 0o700)
     except Exception:
         os.close(fd)
         raise
 
     return fd
+
+
+def _check_owner(fd, path):
+    st = os.fstat(fd)
+    if st.st_uid != os.getuid():
+        raise StateDirError("%s is owned by uid %d, not you" % (path, st.st_uid))
+    return st
 
 
 def _read_bounded(dir_fd, name, limit, tail=False):
@@ -365,7 +408,7 @@ def cmd_nudge(kind, hour, title, body):
         entries = read_history()
         anchor = entries[-1].get("end", 0) if entries else 0
 
-    nudge_fd = _open_private_dir(NUDGE_NAME, parent_fd=state_dir_fd())
+    nudge_fd = _open_owned_dir(NUDGE_NAME, state_dir_fd())
     try:
         marker = "%s-%d-%d" % (kind, anchor, hour)
         try:

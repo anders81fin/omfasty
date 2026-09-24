@@ -63,6 +63,29 @@ with tempfile.TemporaryDirectory() as home:
     check("  ...and says why", "cannot open" in p.stderr, True)
     check("  ...and writes nothing through it", os.listdir(victim), [])
 
+# 2b. A symlinked ancestor is refused too: the walk from HOME opens every
+#     component with O_NOFOLLOW, not just the last one.
+for ancestor in (".local/state", ".local"):
+    with tempfile.TemporaryDirectory() as home:
+        victim = os.path.join(home, "victim")
+        os.makedirs(victim)
+        parent = os.path.dirname(os.path.join(home, ancestor))
+        os.makedirs(parent, exist_ok=True)
+        os.symlink(victim, os.path.join(home, ancestor))
+        p = run(home, "start", "16", expect_ok=False)
+        check("a symlinked ~/%s is refused" % ancestor, p.returncode, 1)
+        check("  ...and nothing is created through it", os.listdir(victim), [])
+
+# 2c. HOME itself is the trusted root and may be a symlink (e.g. /var/home).
+with tempfile.TemporaryDirectory() as tmp:
+    real = os.path.join(tmp, "real-home")
+    os.makedirs(real)
+    link = os.path.join(tmp, "home")
+    os.symlink(real, link)
+    run(link, "start", "16")
+    check("a symlinked HOME still works",
+          os.path.isfile(os.path.join(state_dir(real), "state.json")), True)
+
 # 3. A symlinked state file is not written through.
 with tempfile.TemporaryDirectory() as home:
     d = state_dir(home)
